@@ -3,8 +3,9 @@ from flask_cors import CORS
 import librosa
 import numpy as np
 import os
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, butter, filtfilt
 from scipy.stats import mode
+from collections import Counter
 
 app = Flask(__name__)
 CORS(app)
@@ -79,9 +80,55 @@ def estimate_key_simple(chroma):
     else:
         return root_note, 'Major', 0.5
 
-def detect_bpm_robust(y, sr):
+def preprocess_audio(y, sr):
     """
-    Robust BPM detection using multiple methods and validation
+    Enhanced audio preprocessing for better BPM detection
+    """
+    # Normalize audio
+    y = librosa.util.normalize(y)
+    
+    # Apply high-pass filter to remove very low frequencies that can interfere
+    nyquist = sr / 2
+    low_cutoff = 80 / nyquist
+    b, a = butter(4, low_cutoff, btype='high')
+    y = filtfilt(b, a, y)
+    
+    # Apply gentle compression to even out dynamics
+    y = np.sign(y) * np.power(np.abs(y), 0.7)
+    
+    return y
+
+def enhanced_onset_detection(y, sr, hop_length=512):
+    """
+    Enhanced onset detection with multiple onset strength functions
+    """
+    # Multiple onset strength functions
+    onset_strengths = []
+    
+    # 1. Spectral flux (default)
+    onset_flux = librosa.onset.onset_strength(
+        y=y, sr=sr, hop_length=hop_length, feature=librosa.feature.spectral_centroid
+    )
+    onset_strengths.append(('spectral_flux', onset_flux))
+    
+    # 2. Complex domain onset detection
+    onset_complex = librosa.onset.onset_strength(
+        y=y, sr=sr, hop_length=hop_length, feature=librosa.stft
+    )
+    onset_strengths.append(('complex', onset_complex))
+    
+    # 3. Percussive component
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+    onset_percussive = librosa.onset.onset_strength(
+        y=y_percussive, sr=sr, hop_length=hop_length
+    )
+    onset_strengths.append(('percussive', onset_percussive))
+    
+    return onset_strengths
+
+def detect_bpm_enhanced(y, sr):
+    """
+    Enhanced BPM detection with improved accuracy
     
     Args:
         y: audio time series
@@ -90,141 +137,195 @@ def detect_bpm_robust(y, sr):
     Returns:
         dict: BPM analysis results
     """
-    # Ensure we have enough audio (at least 10 seconds for reliable BPM)
+    # Preprocess audio
+    y = preprocess_audio(y, sr)
+    
+    # Ensure we have enough audio
     min_duration = 10.0
     if len(y) < min_duration * sr:
         print(f"Warning: Audio is only {len(y)/sr:.1f}s long, BPM detection may be unreliable")
     
-    # Use first 60 seconds max for efficiency
-    max_samples = int(60 * sr)
+    # Use up to 90 seconds for better analysis
+    max_samples = int(90 * sr)
     if len(y) > max_samples:
         y = y[:max_samples]
-        print(f"Using first 60 seconds of audio for BPM analysis")
-    
-    # Normalize audio
-    y = librosa.util.normalize(y)
+        print(f"Using first 90 seconds of audio for BPM analysis")
     
     all_bpms = []
     all_confidences = []
     method_names = []
     
-    # Method 1: Standard librosa beat tracking with single best hop length
+    # Method 1: Enhanced beat tracking with multiple configurations
+    hop_lengths = [256, 512, 1024]  # Try different hop lengths
+    for hop_length in hop_lengths:
+        try:
+            # Try different start BPMs
+            start_bpms = [90, 120, 140]
+            for start_bpm in start_bpms:
+                tempo, beats = librosa.beat.beat_track(
+                    y=y, 
+                    sr=sr, 
+                    hop_length=hop_length,
+                    start_bpm=start_bpm,
+                    trim=False,
+                    units='frames'
+                )
+                
+                # Handle array vs scalar tempo
+                if hasattr(tempo, '__len__'):
+                    tempo = tempo[0] if len(tempo) > 0 else 120.0
+                
+                if 60 <= tempo <= 220 and len(beats) > 5:
+                    # Calculate confidence based on beat consistency
+                    beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
+                    intervals = np.diff(beat_times)
+                    
+                    if len(intervals) > 3:
+                        # Check interval consistency
+                        median_interval = np.median(intervals)
+                        valid_intervals = intervals[
+                            (intervals >= median_interval * 0.8) & 
+                            (intervals <= median_interval * 1.2)
+                        ]
+                        
+                        if len(valid_intervals) > len(intervals) * 0.6:  # At least 60% consistent
+                            consistency = len(valid_intervals) / len(intervals)
+                            all_bpms.append(float(tempo))
+                            all_confidences.append(consistency * 0.8)
+                            method_names.append(f'beat_track_h{hop_length}_s{start_bpm}')
+                            
+                            # Also calculate from intervals
+                            refined_interval = np.median(valid_intervals)
+                            interval_bpm = 60.0 / refined_interval
+                            if 60 <= interval_bpm <= 220:
+                                all_bpms.append(float(interval_bpm))
+                                all_confidences.append(consistency * 0.9)
+                                method_names.append(f'intervals_h{hop_length}_s{start_bpm}')
+        except Exception as e:
+            print(f"Beat tracking failed for hop_length={hop_length}: {e}")
+    
+    # Method 2: Enhanced onset-based detection
     try:
-        # Use 512 hop length as it's most reliable for most music
-        tempo, beats = librosa.beat.beat_track(
-            y=y, 
-            sr=sr, 
-            hop_length=512,
-            start_bpm=120.0,
-            trim=False
-        )
+        onset_strengths = enhanced_onset_detection(y, sr, hop_length=512)
         
-        # Ensure tempo is a scalar
-        if hasattr(tempo, '__len__'):
-            tempo = tempo[0] if len(tempo) > 0 else 120.0
-        
-        if 60 <= tempo <= 200 and len(beats) > 3:
-            all_bpms.append(float(tempo))
-            all_confidences.append(0.8)
-            method_names.append('beat_track_primary')
+        for onset_name, onset_strength in onset_strengths:
+            # Peak detection on onset strength
+            peaks, properties = find_peaks(
+                onset_strength, 
+                height=np.mean(onset_strength) + 0.5 * np.std(onset_strength),
+                distance=int(0.1 * sr / 512)  # Minimum 100ms between peaks
+            )
             
-            # Calculate from beat intervals for verification
-            beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=512)
-            if len(beat_times) > 4:
-                intervals = np.diff(beat_times)
-                # Remove outliers more aggressively
-                median_interval = np.median(intervals)
+            if len(peaks) > 10:
+                peak_times = librosa.frames_to_time(peaks, sr=sr, hop_length=512)
+                intervals = np.diff(peak_times)
+                
+                # Filter reasonable intervals
                 valid_intervals = intervals[
-                    (intervals >= median_interval * 0.7) & 
-                    (intervals <= median_interval * 1.3)
+                    (intervals >= 0.25) & (intervals <= 1.2)
                 ]
                 
-                if len(valid_intervals) > 3:
-                    refined_interval = np.median(valid_intervals)
-                    interval_bpm = 60.0 / refined_interval
-                    if 60 <= interval_bpm <= 200:
-                        all_bpms.append(float(interval_bpm))
-                        # Higher confidence for consistent intervals
-                        consistency = 1.0 - (np.std(valid_intervals) / refined_interval)
-                        all_confidences.append(float(max(0.4, consistency * 0.9)))
-                        method_names.append('beat_intervals_refined')
-    except Exception as e:
-        print(f"Primary beat tracking failed: {e}")
-    
-    # Method 2: Onset-based detection (simplified)
-    try:
-        onsets = librosa.onset.onset_detect(
-            y=y, 
-            sr=sr,
-            hop_length=512,
-            delta=0.07,
-            wait=int(0.15 * sr / 512),
-            units='frames'
-        )
-        
-        if len(onsets) > 10:
-            onset_times = librosa.frames_to_time(onsets, sr=sr)
-            intervals = np.diff(onset_times)
-            
-            # Focus on the most common interval
-            valid_intervals = intervals[
-                (intervals >= 0.3) & (intervals <= 1.0)
-            ]
-            
-            if len(valid_intervals) > 8:
-                # Use histogram with fewer bins for cleaner peaks
-                hist, bins = np.histogram(valid_intervals, bins=20)
-                peak_idx = np.argmax(hist)
-                dominant_interval = (bins[peak_idx] + bins[peak_idx + 1]) / 2
-                
-                if dominant_interval > 0:
-                    onset_bpm = 60.0 / dominant_interval
-                    if 60 <= onset_bpm <= 200:
-                        all_bpms.append(float(onset_bpm))
-                        # Confidence based on peak dominance
-                        peak_dominance = hist[peak_idx] / len(valid_intervals)
-                        all_confidences.append(float(min(0.7, peak_dominance)))
-                        method_names.append('onset_histogram')
+                if len(valid_intervals) > 8:
+                    # Use clustering to find dominant interval
+                    # Round to nearest 0.01 seconds for clustering
+                    rounded_intervals = np.round(valid_intervals, 2)
+                    interval_counts = Counter(rounded_intervals)
+                    
+                    # Get the most common interval
+                    dominant_interval = interval_counts.most_common(1)[0][0]
+                    dominant_count = interval_counts.most_common(1)[0][1]
+                    
+                    if dominant_count >= 3:  # At least 3 occurrences
+                        onset_bpm = 60.0 / dominant_interval
+                        if 60 <= onset_bpm <= 220:
+                            confidence = dominant_count / len(valid_intervals)
+                            all_bpms.append(float(onset_bpm))
+                            all_confidences.append(confidence * 0.7)
+                            method_names.append(f'onset_{onset_name}')
     except Exception as e:
         print(f"Onset method failed: {e}")
     
-    # Method 3: Simplified autocorrelation
+    # Method 3: Autocorrelation with multiple window sizes
     try:
-        onset_strength = librosa.onset.onset_strength(
-            y=y, 
-            sr=sr, 
-            hop_length=512
-        )
+        # Use spectral flux onset strength
+        onset_strength = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
         
-        if len(onset_strength) > 100:
-            # Autocorrelation
-            autocorr = librosa.autocorrelate(onset_strength)
+        # Try different autocorrelation window sizes
+        for window_factor in [1.0, 1.5, 2.0]:
+            window_size = int(len(onset_strength) * window_factor)
+            if window_size > len(onset_strength):
+                window_size = len(onset_strength)
+            
+            # Autocorrelation on a window
+            autocorr = librosa.autocorrelate(onset_strength[:window_size])
             
             # Convert to BPM range
-            min_lag = int(60 * sr / (512 * 180))  # 180 BPM max
-            max_lag = int(60 * sr / (512 * 80))   # 80 BPM min
+            min_lag = int(60 * sr / (512 * 200))  # 200 BPM max
+            max_lag = int(60 * sr / (512 * 60))   # 60 BPM min
             
             if max_lag < len(autocorr) and min_lag < max_lag:
                 autocorr_section = autocorr[min_lag:max_lag]
                 
-                # Find the strongest peak
-                peak_idx = np.argmax(autocorr_section)
-                peak_lag = peak_idx + min_lag
-                peak_bpm = 60 * sr / (512 * peak_lag)
+                # Find multiple peaks
+                peaks, properties = find_peaks(
+                    autocorr_section,
+                    height=np.mean(autocorr_section) + 0.3 * np.std(autocorr_section),
+                    distance=int(0.05 * sr / 512)
+                )
                 
-                if 80 <= peak_bpm <= 180:
-                    all_bpms.append(float(peak_bpm))
-                    # Confidence based on peak strength
-                    peak_strength = autocorr_section[peak_idx] / np.max(autocorr_section)
-                    all_confidences.append(float(peak_strength * 0.6))
-                    method_names.append('autocorr_peak')
+                if len(peaks) > 0:
+                    # Get top peaks
+                    peak_heights = autocorr_section[peaks]
+                    top_peaks = peaks[np.argsort(peak_heights)[-3:]]  # Top 3 peaks
+                    
+                    for peak_idx in top_peaks:
+                        peak_lag = peak_idx + min_lag
+                        peak_bpm = 60 * sr / (512 * peak_lag)
+                        
+                        if 60 <= peak_bpm <= 200:
+                            # Confidence based on peak prominence
+                            peak_strength = autocorr_section[peak_idx] / np.max(autocorr_section)
+                            all_bpms.append(float(peak_bpm))
+                            all_confidences.append(peak_strength * 0.6)
+                            method_names.append(f'autocorr_w{window_factor}')
     except Exception as e:
         print(f"Autocorrelation method failed: {e}")
     
-    # If no methods worked, try simple fallback
+    # Method 4: Tempogram analysis
+    try:
+        # Use librosa's tempogram
+        tempogram = librosa.feature.tempogram(
+            onset_envelope=librosa.onset.onset_strength(y=y, sr=sr),
+            sr=sr,
+            hop_length=512
+        )
+        
+        # Find dominant tempo from tempogram
+        tempo_axis = librosa.tempo_frequencies(n_bins=tempogram.shape[0], sr=sr, hop_length=512)
+        tempo_strength = np.mean(tempogram, axis=1)
+        
+        # Find peaks in tempo strength
+        peaks, properties = find_peaks(
+            tempo_strength,
+            height=np.mean(tempo_strength) + 0.5 * np.std(tempo_strength),
+            distance=5
+        )
+        
+        if len(peaks) > 0:
+            for peak_idx in peaks:
+                peak_tempo = tempo_axis[peak_idx]
+                if 60 <= peak_tempo <= 200:
+                    peak_strength = tempo_strength[peak_idx] / np.max(tempo_strength)
+                    all_bpms.append(float(peak_tempo))
+                    all_confidences.append(peak_strength * 0.8)
+                    method_names.append('tempogram')
+    except Exception as e:
+        print(f"Tempogram method failed: {e}")
+    
+    # If no methods worked, use simple fallback
     if not all_bpms:
         try:
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=512)
             if hasattr(tempo, '__len__'):
                 tempo = tempo[0] if len(tempo) > 0 else 120.0
             return {
@@ -243,7 +344,7 @@ def detect_bpm_robust(y, sr):
                 'method_details': ['default']
             }
     
-    # Convert to numpy arrays - ensure all elements are scalars
+    # Convert to numpy arrays
     all_bpms = np.array([float(x) for x in all_bpms])
     all_confidences = np.array([float(x) for x in all_confidences])
     
@@ -251,47 +352,72 @@ def detect_bpm_robust(y, sr):
     print(f"Methods: {method_names}")
     print(f"Confidences: {all_confidences}")
     
-    # Simple clustering approach
+    # Improved clustering and selection
     if len(all_bpms) > 1:
-        # Find the BPM with highest confidence
-        primary_idx = np.argmax(all_confidences)
-        primary_bpm = all_bpms[primary_idx]
-        primary_confidence = all_confidences[primary_idx]
+        # Cluster similar BPMs
+        clusters = []
+        cluster_confidences = []
         
-        print(f"Primary BPM candidate: {primary_bpm:.1f} (confidence: {primary_confidence:.2f})")
+        for bpm, confidence in zip(all_bpms, all_confidences):
+            # Find cluster for this BPM
+            assigned = False
+            for i, cluster in enumerate(clusters):
+                cluster_center = np.mean(cluster)
+                if abs(bpm - cluster_center) <= 4:  # Within 4 BPM
+                    cluster.append(bpm)
+                    cluster_confidences[i].append(confidence)
+                    assigned = True
+                    break
+            
+            if not assigned:
+                clusters.append([bpm])
+                cluster_confidences.append([confidence])
         
-        # Find all BPMs within ±5 of the primary
-        close_mask = np.abs(all_bpms - primary_bpm) <= 5
-        close_bpms = all_bpms[close_mask]
-        close_confidences = all_confidences[close_mask]
+        # Evaluate clusters
+        cluster_scores = []
+        for cluster, confidences in zip(clusters, cluster_confidences):
+            cluster_mean = np.mean(cluster)
+            cluster_size = len(cluster)
+            avg_confidence = np.mean(confidences)
+            
+            # Score based on size, confidence, and being in sweet spot
+            size_score = min(cluster_size / 3, 1.0)  # Normalize by expected max
+            confidence_score = avg_confidence
+            
+            # Prefer tempos in the sweet spot (90-150 BPM)
+            if 90 <= cluster_mean <= 150:
+                sweet_spot_score = 1.0
+            elif 70 <= cluster_mean <= 180:
+                sweet_spot_score = 0.8
+            else:
+                sweet_spot_score = 0.6
+            
+            total_score = size_score * confidence_score * sweet_spot_score
+            cluster_scores.append(total_score)
         
-        if len(close_bpms) > 1:
-            # Use weighted average of close BPMs
-            final_bpm = np.average(close_bpms, weights=close_confidences)
-            final_confidence = np.mean(close_confidences)
-            print(f"Averaged {len(close_bpms)} close estimates: {final_bpm:.1f}")
-        else:
-            final_bpm = primary_bpm
-            final_confidence = primary_confidence
-            print(f"Using primary estimate: {final_bpm:.1f}")
+        # Select best cluster
+        best_cluster_idx = np.argmax(cluster_scores)
+        best_cluster = clusters[best_cluster_idx]
+        best_confidences = cluster_confidences[best_cluster_idx]
         
-        # Check for obvious tempo multiples
-        other_bpms = all_bpms[~close_mask]
-        if len(other_bpms) > 0:
-            for other_bpm in other_bpms:
-                ratio = final_bpm / other_bpm
-                if 1.8 <= ratio <= 2.2:  # final_bpm is roughly double other_bpm
-                    if 90 <= other_bpm <= 140:  # other_bpm is in sweet spot
-                        print(f"Considering half-time: {other_bpm:.1f} instead of {final_bpm:.1f}")
-                        final_bpm = other_bpm
-                        final_confidence *= 0.9
-                        break
-                elif 0.45 <= ratio <= 0.55:  # final_bpm is roughly half other_bpm
-                    if 90 <= other_bpm <= 140:  # other_bpm is in sweet spot
-                        print(f"Considering double-time: {other_bpm:.1f} instead of {final_bpm:.1f}")
-                        final_bpm = other_bpm
-                        final_confidence *= 0.9
-                        break
+        # Use weighted average within the best cluster
+        final_bpm = np.average(best_cluster, weights=best_confidences)
+        final_confidence = np.mean(best_confidences)
+        
+        print(f"Best cluster: {best_cluster} -> {final_bpm:.1f}")
+        
+        # Final validation and correction
+        # Check for obvious half/double tempo issues
+        if final_bpm > 160:
+            half_tempo = final_bpm / 2
+            if 80 <= half_tempo <= 140:
+                print(f"Correcting from {final_bpm:.1f} to {half_tempo:.1f} (half-time)")
+                final_bpm = half_tempo
+        elif final_bpm < 80:
+            double_tempo = final_bpm * 2
+            if 90 <= double_tempo <= 160:
+                print(f"Correcting from {final_bpm:.1f} to {double_tempo:.1f} (double-time)")
+                final_bpm = double_tempo
     else:
         final_bpm = all_bpms[0]
         final_confidence = all_confidences[0]
@@ -301,7 +427,7 @@ def detect_bpm_robust(y, sr):
     return {
         'bpm': float(final_bpm),
         'confidence': float(final_confidence),
-        'method': 'robust_simplified',
+        'method': 'enhanced_multi_method',
         'all_estimates': [float(x) for x in sorted(set(np.round(all_bpms, 1)))],
         'method_details': method_names
     }
@@ -366,8 +492,8 @@ def analyze():
         y, sr = librosa.load(temp_path, sr=None)
         print(f"Loaded audio: {len(y)} samples at {sr} Hz ({len(y)/sr:.1f} seconds)")
         
-        # Analyze BPM with robust method
-        bpm_analysis = detect_bpm_robust(y, sr)
+        # Analyze BPM with enhanced method
+        bpm_analysis = detect_bpm_enhanced(y, sr)
         
         # Analyze key and mode
         harmony_analysis = analyze_harmony(y, sr)
@@ -417,7 +543,7 @@ def analyze_detailed():
         print(f"Loaded audio: {len(y)} samples at {sr} Hz ({len(y)/sr:.1f} seconds)")
         
         # Basic analysis
-        bpm_analysis = detect_bpm_robust(y, sr)
+        bpm_analysis = detect_bpm_enhanced(y, sr)
         harmony_analysis = analyze_harmony(y, sr)
         
         # Additional harmonic analysis
